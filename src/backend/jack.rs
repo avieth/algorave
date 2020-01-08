@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc, Condvar, Mutex};
 use jack;
 
+/*
 /// A buffer and a write index. Reads are taken from the write index plus 1
 /// modulo the buffer size.
 pub struct Loopback {
@@ -47,6 +48,7 @@ impl Loopback {
     }
 
 }
+*/
 
 pub struct JackAudioInput {
     jai_buffer: Vec<f32>,
@@ -60,56 +62,6 @@ pub struct JackAudioOutput {
     /// The port to which we'll copy data, from the jao_buffer.
     jao_port: jack::Port<jack::AudioOut>
 }
-
-// What will a program look like?
-// Should be inspired by FRP. It's a set of non-recursive bindings, each of
-// which defines a time-varying signal. Primitives like numbers or bools are
-// constant signals. Non-constant signals include
-// - now, giving the current frame
-// - JACK audio and MIDI inputs
-// Output signals cannot be used, but loopbacks can be declared, effectively
-// creating an input from an output that is n frames behind the output.
-//
-// What changes can be made to the system? You can
-// - Add inputs and outputs. This is all done in the control thread, not the
-//   process callback.
-//   It should also make sense to remove inputs and outputs. Any references
-//   to inputs in the program can be defaulted to constant 0, and a set
-//   reference to a missing output can become a no-op.
-// - Declare loopbacks, bringing a new input name into scope, but not a new
-//   JACK port.
-//
-//   What is the meaning of this though?
-//
-//     declare output output1
-//     let input1  = loopback 0 output1
-//     set output1 = input1
-//
-//   We declare an output, then we assign it to itself at the prior frame.
-//   This _ought_ to be disallowed by no-recursive-bindings. It seems like it's
-//   not though, because of the initial 'declare output output1'. We want a
-//   pure functional language with equational reasoning, so we should have that
-//   this program is the same as
-//
-//     set output1 = loopback 0 output1
-//
-//    which is nonsense.
-//
-//
-// What does execution look like? Surely what we want is something like this:
-//
-// 1. memcpy each of the JACK inputs to buffers owned by the process callback
-//    state.
-// 2. For each frame, for each output, evaluate the output and write it to
-//    buffers owned by the process callback state.
-//    This deals with loopback state.
-// 3. For each JACK output, memcpy the corresponding buffer.
-//
-// So the program state includes:
-// - for each input, a buffer, keyed by name.
-// - for each output, a buffer and a program.
-// The program can reference input buffers by name, which we look up in the
-// hash map.
 
 type Identifier = u32;
 
@@ -273,58 +225,113 @@ impl ExecutableState {
 /// they are always valid, and that there are no races.
 unsafe impl Send for ExecutableState {}
 
-
-struct Stage<T> {
-    stage_value: T,
-    stage_processed: bool
-}
-
-// How to represent a program?
-// We'd prefer to not have a recursive datatype.
-
+// TODO representation of a program? Preferably not a recursive datatype. Use
+// a Vec<Instruction> or something?
 pub struct Program {}
 
-pub enum Instruction {
-    /// Add a loopback called first identifier, referencing second identifier,
-    /// using this Loopback buffer.
-    AddLoopback(u32, u32, Loopback),
-    /// Add an output with a given identifier, set to run a given program at
-    /// each frame.
-    AddOutput(u32, Program, JackAudioOutput),
-    AddInput(u32, JackAudioInput)
+/// Synchronization mechanism between processor and controller
+/// Will be found inside an Arc, of which the processor and controller threads
+/// each have a clone.
+/// The controller thread will wait on the condition variable immediately after
+/// it passes a new executable state to the processor through the mutex.
+/// Only after the processor signals it will the controller wake up and perform
+/// any necessary deallocation.
+pub struct Synchro<T> {
+    synchro_mutex: Mutex<T>,
+    synchro_cond: Condvar
 }
+
+/// Shared state between processor and controller. Will be held inside a mutex
+/// by way of Synchro<SharedState>.
+///   data SharedState t = NoChange | Staged change | Processed change
+/// But, for technical reasons regarding its use in a mutex, and dealing with
+/// mutable references to it, "Processed" is expressed as "Staged" with a "true"
+/// second field.
+pub enum Stage<T> {
+    NoStage,
+    Staged(T, bool),
+}
+
+type SharedState = Arc<Synchro<Stage<ExecutableState>>>;
 
 pub struct Controller {
     cont_client:   jack::AsyncClient<(), Processor>,
     cont_state:    DescriptiveState,
-    cont_stage:    Arc<Mutex<Option<Stage<ExecutableState>>>>
+    cont_shared:   SharedState
 }
 
 impl Controller {
+
     /// Stage the current state by generating the executable state and updating
     /// the mutex-protected location.
+    ///
+    /// Expects that when the lock is acquired, it contains NoStage.
+    /// When this routine finishes, the mutex will again contain NoStage.
+    /// It will put a Staged(st, false) into the mutex, then wait on the
+    /// condition variable until it becomes Staged(st', true), at which point
+    /// it will set the mutex to NoStage, release the lock, and deallocate all
+    /// necessary things including st'.
     pub fn stage(&mut self) {
-        let mut executable_state = self.cont_state.make_executable();
-        let mutex = &(*self.cont_stage);
-        let mut mstage = mutex.lock().unwrap();
-        match &mut (*mstage) {
-            // Drop in the new stage and that's all.
-            None => {
-                let new_stage = Stage {
-                    stage_value: executable_state,
-                    stage_processed: false
-                };
-                *mstage = Some(new_stage);
-            },
-            // In this case we need to put in the new stage but must also
-            // get the old stage and de-allocate it.
-            // IIUC this should work: we swap the references, so that when
-            // executable_state goes out of scope, it actually de-allocates
-            // what was formerly stage_value.
-            Some(stage) => {
-                std::mem::swap(&mut stage.stage_value, &mut executable_state);
-                stage.stage_processed = false;
+        let mut new_executable_state = self.cont_state.make_executable();
+        // Dereference goes through the Arc to get the Synchro.
+        // We take a reference; don't want to move it from self.
+        let synchro: &Synchro<Stage<ExecutableState>> = &(*self.cont_shared);
+        // We get a mutex guard (the thing that locks the mutex when it goes
+        // out of scope). Dereferencing gives the stage, of which we'll take a
+        // mutable reference.
+        // No no no, we want to take ownership of the thing in the mutex.
+        // But we can't! That's why we can't put an ENUM into the mutex; we
+        // have to wrap it in a cell....
+        //
+        // hm, but can't I just overwrite the memory? Presumably Synchro
+        // compiles to a union type...
+        let mut guard = synchro.synchro_mutex.lock().unwrap();
+        // Stage is mutable because we'll use it to dereference from the guard
+        // later on, and in a loop.
+        let mut stage = &mut (*guard);
+        match stage {
+            // TODO better panic message.
+            // Why is it impossible? Because we set this back to NoStage
+            // at the end of this route.
+            Stage::Staged(_, _) => panic!("impossible"),
+            Stage::NoStage => {}
+        }
+        // Write the new executable state to the mutex, then wait on the
+        // condition variable for the processor thread to signal it.
+        *stage = Stage::Staged(new_executable_state, false);
+        // Rust docs say spurious wakeups are possible, so if we still see a
+        // Staged value we try again.
+        // Possibility of livelock in case the processor thread never sets
+        // processed to true. But the only case it wouldn't do that is if it
+        // panics.
+        loop {
+            guard = synchro.synchro_cond.wait(guard).unwrap();
+            stage = &mut (*guard);
+            match stage {
+                // Processor changed it back to NoStage. That's a bug.
+                Stage::NoStage => panic!("processor put NoStage"),
+                Stage::Staged(_old_executable_state, processed) => {
+                    // If *processed is false, assume it's a spurious wakeup.
+                    if *processed {
+                        // Break from the loop, thereby de-allocating
+                        // _old_executable_state
+                        // TODO now we can deallocate any buffers that aren't
+                        // needed anymore. Those should be computed earlier in
+                        // this function.
+                        break;
+                    }
+                }
             }
+        }
+        *stage = Stage::NoStage;
+    }
+
+    // This function just for testing.
+    pub fn set_output_level(&mut self, id: u32, level: f32) {
+        let moutput = &mut self.cont_state.ds_jack_outputs.get_mut(&id);
+        if let Some(output) = moutput {
+            let vbuffer = vec![level; self.cont_client.as_client().buffer_size() as usize];
+            output.jao_buffer.copy_from_slice(&vbuffer);
         }
     }
 
@@ -357,6 +364,7 @@ impl Controller {
         // still referencing it, because the HasHMap will delete the thing?
         self.cont_state.ds_jack_inputs.insert(id, input);
     }
+    /*
     pub fn add_loopback(&self, name: u32, output: u32, size: usize) -> () {
         /*let lo = Loopback::new(size, 0.0);
         // Inform the process callback that this loopback should be
@@ -367,30 +375,9 @@ impl Controller {
         // This should de-allocate all of the garbage.
         stage.garbage.clear();*/
     }
+    */
 }
 
-/// Synchronization mechanism between processor and controller
-/// Will be found inside an Arc, of which the processor and controller threads
-/// each have a clone.
-/// The controller thread will wait on the condition variable immediately after
-/// it passes a new executable state to the processor through the mutex.
-/// Only after the processor signals it will the controller wake up and perform
-/// any necessary deallocation.
-pub struct Synchro<T> {
-    synchro_mutex: Mutex<T>,
-    synchro_cond: Condvar
-}
-
-/// Shared state between processor and controller. Will be held inside a mutex
-/// by way of Synchro<SharedState>.
-///   data SharedState t = NoChange | Staged change | Processed change
-pub enum Stage<T> {
-    NoChange,
-    Staged(t),
-    Processed(t)
-}
-
-type SharedState = Arc<Synchro<Stage<ExecutableState>>>
 
 pub struct Processor {
     // jack::Frames is 32 bits.
@@ -405,15 +392,10 @@ pub struct Processor {
     // Client.sample_rate function.
     sample_rate:   usize,
     buffer_size:   jack::Frames,
-    // For each named loopback, its buffer data and the name of the proper
-    // output which it samples.
-    loopbacks:     HashMap<u32, (u32, Loopback)>,
-    jack_inputs:   HashMap<u32, JackAudioInput>,
-    jack_outputs:  HashMap<u32, JackAudioOutput>,
     // TODO subsumes the above 3 fields.
     proc_state:    ExecutableState,
     // Changes to the system come in through here.
-    proc_stage:    Arc<Mutex<Option<Stage<ExecutableState>>>>
+    proc_shared:   SharedState
 }
 
 // TODO FIXME
@@ -484,60 +466,64 @@ impl Processor {
             ds_jack_outputs: HashMap::new()
         };
         let executable_state = descriptive_state.make_executable();
-        let stage = None;
-        let arc_mutex = Arc::new(Mutex::new(stage));
+        let stage = Stage::NoStage;
+        let synchro = Synchro {
+            synchro_mutex: Mutex::new(stage),
+            synchro_cond: Condvar::new()
+        };
+        let shared = Arc::new(synchro);
         let processor = Processor {
             current_frame: 0,
             sample_rate: client.sample_rate(),
             buffer_size: client.buffer_size(),
-            loopbacks: HashMap::new(),
-            jack_inputs: HashMap::new(),
-            jack_outputs: HashMap::new(),
             proc_state: executable_state,
-            proc_stage: arc_mutex.clone()
+            proc_shared: shared.clone()
         };
         let async_client = client.activate_async((), processor).unwrap();
         let controller = Controller {
             cont_client: async_client,
             cont_state: descriptive_state,
-            cont_stage: arc_mutex
+            cont_shared: shared
         };
         return controller;
     }
 }
 
 impl jack::ProcessHandler for Processor {
+
     /// The JACK process callback.
     /// It runs the multimedia program for the number of frames given by the
     /// scope.
     /// It will also try, without blocking, to acquire changes to the program
-    /// from the stage mutex.
+    /// from the shared state.
     fn process(&mut self, _client: &jack::Client, scope: &jack::ProcessScope) -> jack::Control {
-        // First, check whether there is a new executable state that we should
-        // use.
-        {
-            let mutex = &(*self.proc_stage);
-            let lock = mutex.try_lock();
-            if let Ok(mut mguard) = lock {
-                let mstage = &mut (*mguard);
-                match mstage {
-                    // Nothing has ever been staged.
-                    None => {},
-                    Some(stage) => {
-                        if stage.stage_processed {
-                            // We put this here, but the controller thread has not
-                            // yet cleaned it up. No problem. This is the typical case
-                            // of "nothing to do" and will be hit on almost every
-                            // process callback.
-                        } else {
-                            // The controller thread has staged a new executable state.
-                            // Take it and pass the current one back.
-                            // The next time the controller thread stages a new
-                            // executable state, it will flip the processed
-                            // bool back to false and we'll go here again.
-                            std::mem::swap(&mut stage.stage_value, &mut self.proc_state);
-                            stage.stage_processed = true;
-                        }
+        // To begin, try to acquire the mutex in a non-blocking way.
+        let synchro: &Synchro<Stage<ExecutableState>> = &(*self.proc_shared);
+        let mut result = synchro.synchro_mutex.try_lock();
+        // If this pattern doesn't match, it means the controller thread has
+        // the lock, but that's totally fine: the pointers in our executable
+        // state are guaranteed to still be valid so we can carry on processing
+        // this frame.
+        if let Ok(ref mut mutex) = result {
+            // Got the lock. The typical case is that there's no staged changes.
+            // TODO it's probably possible to check for staged changes without
+            // acquiring a lock. We don't even need atomic operations for that.
+            // Can just read a cell and if the controller puts something in,
+            // we'll _eventually_ see it and the controller will be waiting for
+            // us to take the mutex and wake it by signalling the condition var.
+            let stage: &mut Stage<ExecutableState> = &mut (*mutex);
+            match stage {
+                Stage::NoStage => {},
+                Stage::Staged(new_executable_state, processed) => {
+                    // NB: it's possible that we see processed = true, because
+                    // the controller thread has not yet picked this up.
+                    if !(*processed) {
+                        // Swap the states, and then update the stage.
+                        // new_executable_state already is an &mut type, because
+                        // stage is &mut Stage<ExecutableState>
+                        std::mem::swap(new_executable_state, &mut self.proc_state);
+                        *processed = true;
+                        synchro.synchro_cond.notify_one();
                     }
                 }
             }
@@ -555,7 +541,6 @@ impl jack::ProcessHandler for Processor {
         self.proc_state.run(self.current_frame, frames_to_process, scope);
         // Cast is fine, frames_to_process is u32
         self.current_frame += frames_to_process as u64;
-
         return jack::Control::Continue;
     }
 }
