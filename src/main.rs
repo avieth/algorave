@@ -86,10 +86,13 @@ fn main() {
 
     let client_result = jack::Client::new("algorave", jack::ClientOptions::NO_START_SERVER);
     let (client, _status) = client_result.unwrap();
-    let controller = jj::Processor::run(client);
-    controller.new_output("left", 0);
-    controller.new_output("right", 1);
-    controller.new_input("mic", 2);
+    let mut controller = jj::Processor::run(client);
+    controller.add_output("left", 0);
+    controller.add_output("right", 1);
+    controller.add_input("mic", 2);
+    // The inputs and outputs appear immediately, but calling stage makes the
+    // process callback become aware of them at some time in the future.
+    controller.stage();
     //let async_client = client.activate_async((), processor).unwrap();
 
     thread::sleep(time::Duration::from_millis(100000000));
