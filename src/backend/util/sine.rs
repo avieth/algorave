@@ -1,4 +1,4 @@
-const two_pi: f64 = 2.0 * std::f64::consts::PI;
+const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
 
 /// Lookup table for sin() between 0 and 2*PI.
 pub struct LookupTable {
@@ -14,7 +14,7 @@ impl LookupTable {
 
     /// Make a lookup table with a given number of samples.
     pub fn new(sample_rate: usize) -> LookupTable {
-        let step = two_pi / (sample_rate as f64);
+        let step = TWO_PI / (sample_rate as f64);
         let mut vec = Vec::with_capacity(sample_rate);
         let mut t : f64 = 0.0;
         for i in 0..sample_rate {
