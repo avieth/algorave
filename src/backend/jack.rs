@@ -157,6 +157,8 @@ pub struct InputPortAndBuffer {
     ipab_buffer: *mut Vec<f32>
 }
 
+unsafe impl Sync for InputPortAndBuffer {}
+
 impl InputPortAndBuffer {
 
     /// Get the value of the _buffer_ at a given offset. Uses an unsafe raw
@@ -191,6 +193,8 @@ pub struct OutputPortAndBuffer {
     opab_port: *mut jack::Port<jack::AudioOut>,
     opab_buffer: *mut Vec<f32>
 }
+
+unsafe impl Sync for OutputPortAndBuffer {}
 
 impl OutputPortAndBuffer {
 
