@@ -313,8 +313,9 @@ pub enum Term {
     Input(Identifier),
     /// Put the current frame onto the stack (casted to i64 from u64).
     Now(),
-    /// Round the top of the stack (an f64) to the nearest lesser i64.
-    Floor(),
+    /// Round the top of the stack (an f64) to the nearest i64.
+    /// Uses rust's f64 rounding semantics.
+    Round(),
     /// Cast the top of the stack (an i64) to an f64.
     Cast(),
     /// Add the top 2 stack elements.
@@ -438,10 +439,10 @@ impl Executable {
                     }
                 },
                 Term::Now() => { self.exec_stack.push(Val::Integral(*current_frame as i64)) },
-                Term::Floor() => {
+                Term::Round() => {
                     match self.exec_stack.pop() {
-                        Some(Val::Floating(f)) => self.exec_stack.push(Val::Integral(f as i64)),
-                        _ => panic!("Floor")
+                        Some(Val::Floating(f)) => self.exec_stack.push(Val::Integral(f.round() as i64)),
+                        _ => panic!("Round")
                     }
                 },
                 Term::Cast() => {
