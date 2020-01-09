@@ -3,6 +3,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use jack;
 
 use crate::backend::util;
+use crate::lang::program::{Program, Term};
 
 /*
 /// A buffer and a write index. Reads are taken from the write index plus 1
@@ -84,6 +85,11 @@ pub struct JackAudioOutput {
 /// loopbacks.
 type Identifier = u32;
 
+/// Type of numbers used in the program definition. Should be fine, and is
+/// convenient because JACK uses it for everything, but maybe we'll want to
+/// use fixed point instead.
+type Number = f32;
+
 /// Completely describes a multimedia program. An `ExecutableState` may be
 /// generated from this.
 ///
@@ -101,7 +107,7 @@ type Identifier = u32;
 pub struct DescriptiveState {
     ds_jack_inputs: HashMap<Identifier, JackAudioInput>,
     ds_jack_outputs: HashMap<Identifier, JackAudioOutput>,
-    ds_programs: HashMap<Identifier, Program>
+    ds_programs: HashMap<Identifier, Program<Identifier, Number>>
 }
 
 impl DescriptiveState {
@@ -137,7 +143,7 @@ impl DescriptiveState {
                 // The required space for a program to run can't be more than
                 // the number of instructions, because each instruction grows
                 // the stack by at most 1.
-                exec_stack: vec![Val::Floating(0.0); program.length()]
+                exec_stack: vec![0.0; program.length()]
             });
         }
         return ExecutableState {
@@ -226,6 +232,178 @@ impl OutputPortAndBuffer {
     }
 }
 
+/// Derived from a program.
+pub struct Executable {
+    exec_program: Program<Identifier, Number>,
+    exec_stack: Vec<Number>
+}
+
+const TWO_PI: f32 = 2.0 * std::f32::consts::PI;
+
+impl Executable {
+    /// Run the executable producing a value.
+    /// Assumes the program actually makes sense. Will do no error handling.
+    /// Needs the current frame, sample rate, and input buffers.
+    pub fn run(&mut self,
+               current_frame: u64,
+               sample_rate: u32,
+               inputs: &HashMap<Identifier, InputPortAndBuffer>,
+               frame_offset: u32,
+               // TODO figure out whether a lookup table is actually useful.
+               _sine_lookup_table: &util::sine::LookupTable) -> f32 {
+        for term in self.exec_program.terms().iter() {
+            match term {
+                Term::Constant(x) => { self.exec_stack.push(*x) },
+                Term::Sine() => {
+                    match self.exec_stack.pop() {
+                        Some(phase) => match self.exec_stack.pop() {
+                            Some(freq) => {
+                                /* let seconds    = current_frame / (sample_rate as u64);
+                                // The sample rate is not going to be very big
+                                // (at most 192000 in all practicality) so it
+                                // should be safe to cast the remainder to u32.
+                                let subseconds = (current_frame % (sample_rate as u64)) as u32;
+                                // This will be problematic...
+                                let t          = seconds as f32
+                                               + (subseconds as f32 / sample_rate as f32);
+                                self.exec_stack.push((TWO_PI * freq * (t + phase)).sin()); */
+                                let s = (current_frame % (sample_rate as u64)) as f32
+                                      / sample_rate as f32;
+                                let t = freq * (s + phase);
+                                self.exec_stack.push((TWO_PI * t).sin());
+                            },
+                            _ => panic!("sine: no frequency given")
+                        },
+                        _ => panic!("sine: no phase given")
+                    }
+                },
+                Term::Sawtooth() => {
+                    match self.exec_stack.pop() {
+                        Some(phase) => match self.exec_stack.pop() {
+                            Some(freq) => {
+                                // Since sample_rate is never going to be too
+                                // big (probably at most 192000) the cast is
+                                // OK.
+                                let s = (current_frame % (sample_rate as u64)) as f32
+                                      / sample_rate as f32;
+                                // s will go from 0.0 to 1.0 every second.
+                                // To match canonical sawtooth, we flip it,
+                                // scale it, and translate it.
+                                let t = freq * (s + phase);
+                                self.exec_stack.push(-2.0 * (t.fract() - 0.5));
+                            },
+                            _ => panic!("sine: no frequency given")
+                        },
+                        _ => panic!("sine: no phase given")
+                    }
+                },
+                Term::Square() => {
+                    match self.exec_stack.pop() {
+                        Some(phase) => match self.exec_stack.pop() {
+                            Some(freq) => {
+                                let s = (current_frame % (sample_rate as u64)) as f32
+                                      / sample_rate as f32;
+                                let t = freq * (s + phase);
+                                // If t is in [0.0,0.5) then give 1.0
+                                // If t is in [0.5,1.0] then give -1.0
+                                // Alternatively:
+                                //   t in [0.0,0.5) -> 0.0
+                                //   t in [0.5,1.0] -> 1.0
+                                // then subtract 0.5, negate, and multiply by
+                                // 2.0
+                                self.exec_stack.push(-2.0 * (t.fract().round() - 0.5));
+                            },
+                            _ => panic!("square: no frequency given")
+                        },
+                        _ => panic!("square: no phase given")
+                    }
+                },
+                Term::Triangle() => {
+                    match self.exec_stack.pop() {
+                        Some(phase) => match self.exec_stack.pop() {
+                            Some(freq) => {
+                                let s = (current_frame % (sample_rate as u64)) as f32
+                                      / sample_rate as f32;
+                                let t = freq * (s + phase);
+                                // Our triangle wave will be
+                                //   0.0 -> -1.0
+                                //   0.5 ->  1.0
+                                //   1.0 -> -1.0
+                                // We'll use the absolute value of t - 0.5.
+                                // To match the canonical triangle waveform, we
+                                // must negate it, move it up by 1/4, then
+                                // scale it by 4.
+                                self.exec_stack.push(-4.0 * (t.fract() - 0.5).abs() + 1.0);
+                            },
+                            _ => panic!("triangle: no frequency given")
+                        },
+                        _ => panic!("triangle: no phase given")
+                    }
+                },
+                Term::Input(identifier) => {
+                    match inputs.get(identifier) {
+                        Some(ipab) => {
+                            self.exec_stack.push(
+                                ipab.get(frame_offset as usize)
+                            );
+                        },
+                        None => panic!("Undefined input reference")
+                    }
+                },
+                Term::Add() => {
+                    match self.exec_stack.pop() {
+                        Some(v1) => match self.exec_stack.pop() {
+                            Some(v2) => self.exec_stack.push(v2 + v1),
+                            _ => panic!("Add")
+                        },
+                        _ => panic!("Add")
+                    }
+                },
+                Term::Subtract() => {
+                    match self.exec_stack.pop() {
+                        Some(v1) => match self.exec_stack.pop() {
+                            Some(v2) => self.exec_stack.push(v2 - v1),
+                            _ => panic!("Subtract")
+                        },
+                        _ => panic!("Subtract")
+                    }
+                },
+                Term::Multiply() => {
+                    match self.exec_stack.pop() {
+                        Some(v1) => match self.exec_stack.pop() {
+                            Some(v2) => self.exec_stack.push(v2 * v1),
+                            _ => panic!("Multiply")
+                        },
+                        _ => panic!("Multiply")
+                    }
+                },
+                Term::Divide() => {
+                    match self.exec_stack.pop() {
+                        Some(v1) => match self.exec_stack.pop() {
+                            Some(v2) => self.exec_stack.push(v2 / v1),
+                            _ => panic!("Divide")
+                        },
+                        _ => panic!("Divide")
+                    }
+                },
+                Term::Mod() => {
+                    match self.exec_stack.pop() {
+                        Some(v1) => match self.exec_stack.pop() {
+                            Some(v2) => self.exec_stack.push(v2 % v1),
+                            _ => panic!("Mod")
+                        },
+                        _ => panic!("Mod")
+                    }
+                }
+            }
+        }
+        match self.exec_stack.pop() {
+            Some(val) => return val,
+            None => return 0.0
+        }
+    }
+}
+
 /// Everything needed by the process callback:
 ///
 /// - JACK audio inputs and buffers to copy to at the beginning of process.
@@ -269,7 +447,8 @@ impl ExecutableState {
     /// A sine wave lookup table is used in the hope that this is faster than
     /// calling sin() all the time.
     pub fn run(&mut self,
-               current_frame: &u64,
+               current_frame: u64,
+               sample_rate: u32,
                frames_to_process: jack::Frames,
                scope: &jack::ProcessScope,
                sine_lookup_table: &util::sine::LookupTable) -> () {
@@ -286,6 +465,7 @@ impl ExecutableState {
                         frame as usize,
                         executable.run(
                             current_frame,
+                            sample_rate,
                             &self.es_jack_inputs,
                             frame,
                             sine_lookup_table
@@ -298,216 +478,6 @@ impl ExecutableState {
         // outputs.
         for (_, opab) in self.es_jack_outputs.iter_mut() {
             opab.copy(scope);
-        }
-    }
-}
-
-#[derive(Clone)]
-pub enum Term {
-    /// Put a constant float onto the stack.
-    ConstFloat(f64),
-    /// Put a constant integer onto the stack.
-    ConstInt(i64),
-    /// Sample an input and put it onto the stack. This will give an f32 casted
-    /// to an f64.
-    Input(Identifier),
-    /// Put the current frame onto the stack (casted to i64 from u64).
-    Now(),
-    /// Round the top of the stack (an f64) to the nearest i64.
-    /// Uses rust's f64 rounding semantics.
-    Round(),
-    /// Cast the top of the stack (an i64) to an f64.
-    Cast(),
-    /// Add the top 2 stack elements.
-    Add(),
-    /// Subtract top of stack from second on stack.
-    Subtract(),
-    Multiply(),
-    /// Divide the second by the top. Must be floats.
-    Divide(),
-    /// Take second of stack modulo top of stack.
-    Mod(),
-    /// Take the sin at the top of the stack.
-    Sine()
-}
-
-#[derive(Clone)]
-/// A program is a sequence of terms, to be interpreted by a stack evaluator.
-pub struct Program {
-    prog_terms: Vec<Term>
-}
-
-impl Program {
-
-    pub fn from_array(terms: &[Term]) -> Program {
-        return Program { prog_terms: Vec::from(terms) };
-    }
-
-    /// The length of the program. Can be useful to know because in order to
-    /// evaluate it, one only needs a stack of at most this size.
-    pub fn length(&self) -> usize {
-        return self.prog_terms.len();
-    }
-}
-
-/// The program evaluator is a stack machine where everything is either a
-/// 64-bit float or a 64-bit integer
-#[derive(Clone, Copy)]
-pub enum Val {
-    Integral(i64),
-    Floating(f64)
-}
-
-impl Val {
-    pub fn normalize(&self) -> f32 {
-        match self {
-            Val::Integral(i) => f32::max(-1.0, f32::min(1.0, *i as f32)),
-            Val::Floating(f) => f32::max(-1.0, f32::min(1.0, *f as f32))
-        }
-    }
-
-    pub fn add(&self, other: &Val) -> Val {
-        match self {
-            Val::Integral(i) => match other {
-                Val::Integral(j) => Val::Integral(*i + *j),
-                Val::Floating(j) => Val::Floating(*i as f64 + *j)
-            }
-            Val::Floating(i) => match other {
-                Val::Integral(j) => Val::Floating(*i + *j as f64),
-                Val::Floating(j) => Val::Floating(*i + *j)
-            }
-        }
-    }
-
-    pub fn subtract(&self, other: &Val) -> Val {
-        match self {
-            Val::Integral(i) => match other {
-                Val::Integral(j) => Val::Integral(*i - *j),
-                Val::Floating(j) => Val::Floating(*i as f64 - *j)
-            }
-            Val::Floating(i) => match other {
-                Val::Integral(j) => Val::Floating(*i - *j as f64),
-                Val::Floating(j) => Val::Floating(*i - *j)
-            }
-        }
-    }
-
-    pub fn multiply(&self, other: &Val) -> Val {
-        match self {
-            Val::Integral(i) => match other {
-                Val::Integral(j) => Val::Integral(*i * *j),
-                Val::Floating(j) => Val::Floating(*i as f64 * *j)
-            }
-            Val::Floating(i) => match other {
-                Val::Integral(j) => Val::Floating(*i * *j as f64),
-                Val::Floating(j) => Val::Floating(*i * *j)
-            }
-        }
-    }
-}
-
-/// Derived from a program.
-pub struct Executable {
-    exec_program: Program,
-    exec_stack: Vec<Val>
-}
-
-impl Executable {
-    /// Run the executable producing a value.
-    /// Assumes the program actually makes sense. Will do no error handling.
-    /// Needs the current frame as well as the input buffers.
-    /// Whatever value is given at the end of the execution, whether a 64 bit
-    /// integral or 64 bit float, it will be casted to an 32 bit float, because
-    /// that's what JACK buffers need. Beware!
-    pub fn run(&mut self,
-               current_frame: &u64,
-               inputs: &HashMap<Identifier, InputPortAndBuffer>,
-               frame_offset: u32,
-               sine_lookup_table: &util::sine::LookupTable) -> f32 {
-        for term in self.exec_program.prog_terms.iter() {
-            match term {
-                Term::ConstFloat(x) => { self.exec_stack.push(Val::Floating(*x)) },
-                Term::ConstInt(x) => { self.exec_stack.push(Val::Integral(*x)) },
-                Term::Input(identifier) => {
-                    match inputs.get(identifier) {
-                        Some(ipab) => {
-                            self.exec_stack.push(
-                                Val::Floating(ipab.get(frame_offset as usize) as f64)
-                            );
-                        },
-                        None => panic!("Undefined input reference")
-                    }
-                },
-                Term::Now() => { self.exec_stack.push(Val::Integral(*current_frame as i64)) },
-                Term::Round() => {
-                    match self.exec_stack.pop() {
-                        Some(Val::Floating(f)) => self.exec_stack.push(Val::Integral(f.round() as i64)),
-                        _ => panic!("Round")
-                    }
-                },
-                Term::Cast() => {
-                    match self.exec_stack.pop() {
-                        Some(Val::Integral(top)) => self.exec_stack.push(Val::Floating(top as f64)),
-                        _ => panic!("Cast")
-                    }
-                },
-                Term::Add() => {
-                    match self.exec_stack.pop() {
-                        Some(v1) => match self.exec_stack.pop() {
-                            Some(v2) => self.exec_stack.push(v2.add(&v1)),
-                            _ => panic!("Add")
-                        },
-                        _ => panic!("Add")
-                    }
-                },
-                Term::Subtract() => {
-                    match self.exec_stack.pop() {
-                        Some(v1) => match self.exec_stack.pop() {
-                            Some(v2) => self.exec_stack.push(v2.subtract(&v1)),
-                            _ => panic!("Subtract")
-                        },
-                        _ => panic!("Subtract")
-                    }
-                },
-                Term::Multiply() => {
-                    match self.exec_stack.pop() {
-                        Some(v1) => match self.exec_stack.pop() {
-                            Some(v2) => self.exec_stack.push(v2.multiply(&v1)),
-                            _ => panic!("Multiply")
-                        },
-                        _ => panic!("Multiply")
-                    }
-                },
-                Term::Divide() => {
-                    match self.exec_stack.pop() {
-                        Some(Val::Floating(v1)) => match self.exec_stack.pop() {
-                            Some(Val::Floating(v2)) => self.exec_stack.push(Val::Floating(v2 / v1)),
-                            _ => panic!("Divide")
-                        },
-                        _ => panic!("Divide")
-                    }
-                },
-                Term::Mod() => {
-                    match self.exec_stack.pop() {
-                        Some(Val::Integral(v1)) => match self.exec_stack.pop() {
-                            Some(Val::Integral(v2)) => self.exec_stack.push(Val::Integral(v2 % v1)),
-                            _ => panic!("Mod")
-                        },
-                        _ => panic!("Mod")
-                    }
-                },
-                Term::Sine() => {
-                    match self.exec_stack.pop() {
-                      //Some(Val::Floating(top)) => self.exec_stack.push(Val::Floating(top.sin())),
-                      Some(Val::Floating(top)) => self.exec_stack.push(Val::Floating(sine_lookup_table.at(top))),
-                      _ => panic!("Sin")
-                    }
-                }
-            }
-        }
-        match self.exec_stack.pop() {
-            Some(val) => return val.normalize(),
-            None => return 0.0
         }
     }
 }
@@ -638,7 +608,7 @@ impl Controller {
     }
 
     /// Set the program for a given output identifier.
-    pub fn set_program(&mut self, id: u32, prog: Program) -> () {
+    pub fn set_program(&mut self, id: u32, prog: Program<Identifier, Number>) -> () {
         self.cont_state.ds_programs.insert(id, prog);
     }
 
@@ -693,6 +663,7 @@ pub struct Processor {
     // So, just use u64... but that complicates the implementation of buffer
     // indexing for 32 bit machines.
     current_frame: u64,
+    sample_rate: u32,
     sine_lookup_table: util::sine::LookupTable,
     // TODO subsumes the above 3 fields.
     proc_state:    ExecutableState,
@@ -722,6 +693,7 @@ impl Processor {
         let shared = Arc::new(synchro);
         let processor = Processor {
             current_frame: 0,
+            sample_rate: client.sample_rate() as u32,
             sine_lookup_table: util::sine::LookupTable::new(client.sample_rate()),
             proc_state: executable_state,
             proc_shared: shared.clone()
@@ -780,7 +752,8 @@ impl jack::ProcessHandler for Processor {
 
         let frames_to_process = scope.n_frames();
         self.proc_state.run(
-            &self.current_frame,
+            self.current_frame,
+            self.sample_rate,
             frames_to_process,
             scope,
             &self.sine_lookup_table

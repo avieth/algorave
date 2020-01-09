@@ -5,6 +5,7 @@ use jack;
 // Apparently this is idiomatic? Even though algorave is this crate?
 extern crate algorave;
 use algorave::backend::jack as jj;
+use algorave::lang::program::{Term, Program};
 
 fn main() {
     let client_result = jack::Client::new(
@@ -18,42 +19,47 @@ fn main() {
     let mut controller = jj::Processor::run(client);
     controller.add_output("left", 0);
     controller.add_output("right", 1);
-    controller.add_input("mic", 2);
-    let prog1 = jj::Program::from_array(&[
+    controller.add_output("fooo", 2);
+    controller.add_output("barr", 3);
+    controller.add_input("mic", 4);
+    // Program 1: take the input and make an envelope.
+    let prog1 = Program::from_array(&[
         // Sample the input.
-        jj::Term::Input(2),
-        // Compute a sawtooth every second between -0.5 and 0.5
-        jj::Term::Now(),
-        jj::Term::ConstInt(48000),
-        jj::Term::Mod(),
-        jj::Term::Cast(),
-        jj::Term::ConstFloat(48000.0),
-        jj::Term::Divide(),
-        jj::Term::ConstFloat(0.5),
-        jj::Term::Subtract(),
-        // Then use it as an envelope by multiplying the input wave, effectively
-        // attenuating it.
-        jj::Term::Multiply()
+        Term::Input(4),
+        // Make an envelope.
+        Term::Constant(2.0), // Frequency
+        Term::Constant(0.0), // Phase
+        Term::Sine(),
+        Term::Multiply()
     ]);
-    let prog2 = jj::Program::from_array(&[
-        // Put now on the stack.
-        jj::Term::Now(),
-        // Take it modulo 48000 (the sample rate).
-        jj::Term::ConstInt(48000),
-        jj::Term::Mod(),
-        // Cast it to a float.
-        jj::Term::Cast(),
-        // Divide it by 48000
-        jj::Term::ConstFloat(48000.0),
-        jj::Term::Divide(),
-        // Multiply by 2Pi
-        jj::Term::ConstFloat(2.0 * std::f64::consts::PI),
-        jj::Term::Multiply(),
-        // Take the sine.
-        jj::Term::Sine()
+    // Program 2 is just a 2Hz sine wave
+    let prog2 = Program::from_array(&[
+        Term::Constant(2.0), // Frequency
+        Term::Constant(0.0), // Phase
+        Term::Sine()
+    ]);
+    let prog3 = Program::from_array(&[
+        Term::Constant(2.0),
+        Term::Constant(0.0),
+        // Derive a ramp from a sawtooth:
+        Term::Sawtooth(),
+        // Flip it and scale it
+        Term::Constant(-0.5),
+        Term::Multiply(),
+        Term::Constant(0.5),
+        Term::Add()
+    ]);
+    let prog4 = Program::from_array(&[
+        Term::Constant(2.0),
+        Term::Constant(0.0),
+        Term::Triangle(),
+        Term::Constant(0.5),
+        Term::Multiply()
     ]);
     controller.set_program(0, prog1);
     controller.set_program(1, prog2);
+    controller.set_program(2, prog3);
+    controller.set_program(3, prog4);
     controller.stage();
 
     thread::sleep(time::Duration::from_millis(1000 * 1000 * 1000));
