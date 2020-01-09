@@ -630,6 +630,8 @@ impl Controller {
         // existing output. The process callback still has raw pointers to
         // the thing that was removed (returned by the insert call). But I can't
         // make it happen...
+        // Well, sure it won't happen, because the program still owns the page
+        // (we don't do very much allocation/deallocation in the demos so far).
         //
         // Anyway, the solution is to keep track of the change and only apply it
         // at the call to `stage`, keeping all of the deleted things around
