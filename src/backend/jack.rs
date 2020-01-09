@@ -572,6 +572,10 @@ pub struct Controller {
 
 impl Controller {
 
+    pub fn client(&self) -> &jack::Client {
+        return self.cont_client.as_client();
+    }
+
     /// Stage the current state by generating the executable state and updating
     /// the mutex-protected location.
     ///
