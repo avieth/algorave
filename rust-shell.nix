@@ -7,6 +7,6 @@ pkgs.rustPlatform.buildRustPackage {
   version = "0.0.1";
   src = ./.;
   checkPhase = "";
-  cargoSha256 = "sha256:1lym5h01if6mbiz1856ks1gj9gwfx9pj7a9jk6viq0ihrbavs9gk";
+  cargoSha256 = "sha256:19x7dqigs5c56q9xncqrs7anz9z0as390nvc73gasj5rwn0xw6pw";
   buildInputs = [ jack2 ];
 }

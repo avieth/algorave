@@ -7,5 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-jack = "0.6.0"
-jack-sys = "0.0.1"
+#jack = "0.6.0"
+#jack-sys = "0.0.1"
+jack = { path = "../rust-jack" }
+jack-sys = { path = "../rust-jack/jack-sys" }
