@@ -301,7 +301,7 @@ pub fn memory_slice(memory: &RawPointer, offset: usize, size: usize) -> Result<*
     // case, it will work out to a copy(void, src, 0) which is fine.
     if size == 0 {
         return Ok(std::ptr::null());
-    } else if offset + (size - 1) >= memory.size {
+    } else if (offset + size) > (memory.size + 1) {
         return Err(MemoryError::MemoryAccessOutOfBounds(offset, size));
     } else {
         unsafe {
@@ -318,7 +318,7 @@ pub fn memory_slice_mut(memory: &RawPointer, offset: usize, size: usize) -> Resu
     // 0 bytes, which is fine.
     if size == 0 {
         return Ok(std::ptr::null_mut());
-    } else if offset + (size - 1) >= memory.size {
+    } else if (offset + size) > (memory.size + 1) {
         return Err(MemoryError::MemoryAccessOutOfBounds(offset, size));
     } else {
         unsafe {
