@@ -9,3 +9,4 @@ edition = "2018"
 [dependencies]
 jack = "0.6.0"
 jack-sys = "0.0.1"
+clap = "2.33.0"
