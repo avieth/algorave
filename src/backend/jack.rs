@@ -352,6 +352,9 @@ impl jack::ProcessHandler for JackProcessor {
             Err(_err) => { 
                 // FIXME TODO what really should we do in case of an
                 // execution error? Are they always fatal?
+                //
+                // TODO print the error
+                println!("JACK client has quit. You probably want to kill this program.");
                 return jack::Control::Quit;
             }
         }
