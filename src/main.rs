@@ -171,11 +171,11 @@ fn main() {
     let midi_ins  = matches.values_of("MIDI input");
     let midi_outs = matches.values_of("MIDI output");
 
+    // 1MiB buffers for MIDI. Should be enough...
     // TODO make this configurable, per port.
-    let midi_buffer_size = 256 * 2usize.pow(10);
+    let midi_buffer_size = 2usize.pow(20);
     // Already validated.
     let memory_size = to_hex_u32(memory.to_string()).unwrap() as usize;
-    println!("memory size is {}", memory_size);
 
     let (client, _) = jack::Client::new("algorave", jack::ClientOptions::NO_START_SERVER).unwrap();
 
