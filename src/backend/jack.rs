@@ -370,52 +370,35 @@ impl IsInputRegion for JackInputRegion {
     // TODO better type for this
     type E = ();
 
-    // What to do for MIDI input? We apparently need a period-level prepare, so
-    // that we can bring in the iterator, and then a frame-level prepare, so
-    // we can extract the frame and put them into the buffer.
-    // So suppose we had a period-level prepare. It gets a MidiIter. We'd also
-    // want a period-level flush, to drop it!
-    //
-    // What exactly is the asymmetry here against write? Can we indeed grab a
-    // new MidiWriter multiple times per process callback, or do we need to use
-    // the same one? Judging from the source program text: YES! So why can't
-    // we have a similar story for reading?
-    // Let's just go by way of Port.buffer(n_frames: Frames) -> *mut c_void ?
-    //
-    // How about this: to prepare the period, we check how many events there
-    // are and set fields on this constructor to 0 for index and that other
-    // value for total count. 
-    //
-    // The morally correct way to do this is to have:
-    //
-    //   prepare_period : Region ->  PeriodState
-    //   prepare_frame  : Region ->  PeriodState -> IO PeriodState
-    //
-    // but to make this happen we would need to have the input region types
-    // associate with their particular period state inside the hash map.
-    //
-    // Naive slow solution: just iterate every single time... it'll be OK so
-    // long as there isn't too much MIDI data.
     fn prepare_frame(&mut self, rframe: usize, ps: &jack::ProcessScope) {
         match self {
             JackInputRegion::JackAudioInput(_) => {}
-            // Take all MIDI events that are for this frame and put them into
-            // the buffer.
+            // For MIDI inputs we make a length-prefixed array where each
+            // element is a pointer to some place in this region (a u32).
+            // It points to a length-prefixed string of bytes where the
+            // length is a u8.
+            //
+            // FIXME this implementation is not ideal, since it iterates over
+            // all MIDI events _for the period_ at each _frame_.
             JackInputRegion::JackMidiInput(port, boxed_buffer) => {
                 let buffer = &mut (*boxed_buffer);
                 let mut offset = 1;
                 let mut event_count: u8 = 0x00;
+                // At most 256 MIDI events. The actual MIDI data starts at the
+                // end of the array of pointers, which is 256*4 + 1 bytes
+                // (1025).
+                let mut addr: usize = 0x00000401;
                 for raw_midi in port.iter(ps) {
                     if raw_midi.time != rframe as u32 { continue; }
-                    // TODO check for overflow.
+                    // FIXME check for overflow.
                     // This will panic and kill the program :O :O
-                    // But 256 or more MIDI events at one frame is probably
-                    // rare, right?
-                    let size = raw_midi.bytes.len();
-                    buffer[offset] = size as u8;
-                    offset += 1;
-                    buffer[offset..(offset+size)].copy_from_slice(raw_midi.bytes);
-                    offset += size;
+                    buffer[offset..offset+3].copy_from_slice(&addr.to_le_bytes());
+                    offset += 4;
+                    let size = raw_midi.bytes.len() as usize;
+                    buffer[addr..addr+3].copy_from_slice(&size.to_le_bytes());
+                    addr += 4;
+                    buffer[addr..(addr+size)].copy_from_slice(raw_midi.bytes);
+                    addr += size;
                     event_count += 1;
                 }
                 buffer[0] = event_count;
@@ -428,7 +411,7 @@ impl IsInputRegion for JackInputRegion {
             JackInputRegion::JackAudioInput(port) => {
                 // JACK input values are 32-bit floats, and we index by the byte, so
                 // we'll check that we're not overstepping it first.
-                if offset > 3 || offset + size > 4 {
+                if offset + size > 4 {
                     return Err(());
                 } else {
                     unsafe {
@@ -440,7 +423,7 @@ impl IsInputRegion for JackInputRegion {
             }
             JackInputRegion::JackMidiInput(_port, boxed_buffer) => {
                 let buffer = &(*boxed_buffer);
-                if offset > buffer.len() - 1 || offset + size > buffer.len() {
+                if (offset + size) > (buffer.len() + 1) {
                     return Err(());
                 } else {
                     unsafe {
@@ -478,7 +461,7 @@ impl IsOutputRegion for JackOutputRegion {
     fn write(&mut self, offset: usize, size: usize, rframe: usize, ps: &jack::ProcessScope) -> Result<*mut u8, ()> {
         match self {
             JackOutputRegion::JackAudioOutput(port) => {
-                if offset > 3 || offset + size > 4 {
+                if offset + size > 4 {
                     return Err(());
                 } else {
                     unsafe {
@@ -492,7 +475,7 @@ impl IsOutputRegion for JackOutputRegion {
             // It's flushed after each frame.
             JackOutputRegion::JackMidiOutput(_port, boxed_buffer) => {
                 let buffer = &mut (*boxed_buffer);
-                if offset > buffer.len() - 1 || offset + size > buffer.len() {
+                if (offset + size) > (buffer.len() + 1) {
                     return Err(());
                 } else {
                     unsafe {
@@ -517,19 +500,31 @@ impl IsOutputRegion for JackOutputRegion {
             // This is called after each frame execution. We just check
             // the first byte, and interpret it as the number of MIDI events
             // to write out.
-            // Each event is a length-prefixed (u8) byte string.
+            //
+            // Each event is a length-prefixed (u32) byte string.
             JackOutputRegion::JackMidiOutput(port, boxed_buffer) => {
-                let mut writer = port.writer(ps);
                 let buffer = &mut (*boxed_buffer);
                 let mut offset: usize = 0;
-                let mut processed_events = 0;
                 let num_events = u8::from_le_bytes([buffer[offset]]);
-                // No i++ operator? wtf?
+                if num_events == 0 { return; }
                 offset += 1;
+                let mut writer = port.writer(ps);
+                let mut processed_events = 0;
                 while processed_events < num_events {
-                    let size = u8::from_le_bytes([buffer[offset]]);
-                    offset += 1;
-                    let bytes = &buffer[offset..offset+(size as usize)];
+                    let addr = u32::from_le_bytes([
+                            buffer[offset],
+                            buffer[offset+1],
+                            buffer[offset+2],
+                            buffer[offset+3]
+                        ]) as usize;
+                    offset += 4;
+                    let size = u32::from_le_bytes([
+                            buffer[addr],
+                            buffer[addr+1],
+                            buffer[addr+2],
+                            buffer[addr+3]
+                        ]) as usize;
+                    let bytes = &buffer[(addr+4)..(addr+4+size)];
                     let rawmidi = jack::RawMidi { time: rframe as u32, bytes: bytes };
                     // FIXME use the result value.
                     let _ = writer.write(&rawmidi);
