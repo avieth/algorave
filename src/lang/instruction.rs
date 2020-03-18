@@ -1050,13 +1050,13 @@ pub fn execute_instruction<In: IsInputRegion, Out: IsOutputRegion>(
     // way to do it.
     match inst {
         Instruction::Trace(size, addr) => {
-            let size = read_u32(memory_slice(frame_info.memory, *size as usize, 4)?);
-            let addr_ptr = read_u32(memory_slice(frame_info.memory, *addr as usize, 4)?);
-            let ptr = memory_slice(frame_info.memory, addr_ptr as usize, size as usize)?;
+            let size_val = read_u32(memory_slice(frame_info.memory, *size as usize, 4)?);
+            let addr_val = read_u32(memory_slice(frame_info.memory, *addr as usize, 4)?);
+            let ptr = memory_slice(frame_info.memory, addr_val as usize, size_val as usize)?;
             // TODO do this better. The sink should be a parameter, so that in
             // realtime scenarios like the JACK backend it can be, for instance,
             // a lock-free queue.
-            unsafe { println!("{:X?} {:X?}", addr, read_bytes(ptr, size as usize)) };
+            unsafe { println!("{:X?} {:X?}", addr_val, read_bytes(ptr, size_val as usize)) };
         }
         Instruction::Stop => {
             return Ok(Control::Stop);
