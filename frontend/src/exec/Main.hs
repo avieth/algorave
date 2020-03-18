@@ -110,11 +110,13 @@ proper_frontend = Frontend
   , include = \fb program _ -> do
       debug fb [ T.pack "including program ", T.pack (show program) ]
       pure (Just program)
-  , commit = \_fb state -> case state of
+  , commit = \fb state -> case state of
       Nothing -> pure (no_update, Nothing)
-      Just prog -> do
-        let prog' = Frontend.assemble prog
-        pure (Update (Just prog') [], Nothing)
+      Just prog -> case Frontend.assemble prog of
+        Left aerr -> do
+          err fb [ T.pack "could not assemble program", T.pack (show aerr) ]
+          pure (no_update, state)
+        Right prog' -> pure (Update (Just prog') [], Nothing)
   , reset  = \_fb _ -> pure Nothing
   }
 
@@ -186,12 +188,27 @@ run_frontend_loop frontend state = do
       lines <- take_until_end
       --let n = show (length lines)
       --debug stderr_feedback [ T.pack ("got " ++ n ++ " lines") ]
+      case Atto.parse (parser frontend) (T.intercalate (T.pack "\n") lines) of
+        Atto.Fail l ctxts errTxt -> do
+          err stderr_feedback $ [ T.pack "failed to parse frontend syntax" ] ++ fmap T.pack ctxts ++ [T.pack errTxt, l]
+          pure state
+        Atto.Partial k -> case k T.empty of
+          Atto.Partial k -> do
+            err stderr_feedback $ [ T.pack "failed to parse frontend syntax", T.pack "partial result" ]
+            pure state
+          Atto.Fail l ctxts errTxt -> do
+            err stderr_feedback $ [ T.pack "failed to parse frontend syntax" ] ++ fmap T.pack ctxts ++ [T.pack errTxt, l]
+            pure state
+          Atto.Done _ syntax -> include frontend stderr_feedback syntax state
+        Atto.Done _ syntax -> include frontend stderr_feedback syntax state
+      {-
       let result = Atto.parseOnly (parser frontend) (T.intercalate (T.pack "\n") lines)
       case result of
-        Left _err -> do
-          err stderr_feedback [ T.pack "failed to parse frontend syntax" ]
+        Left err_txt -> do
+          err stderr_feedback [ T.pack "failed to parse frontend syntax", T.pack err_txt ]
           pure state
         Right syntax -> include frontend stderr_feedback syntax state
+      -}
   run_frontend_loop frontend state'
 
 -- | Print a list of lines under a given severity.

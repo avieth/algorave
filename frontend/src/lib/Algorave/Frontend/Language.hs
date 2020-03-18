@@ -21,14 +21,21 @@ Portability : non-portable (GHC only)
 module Algorave.Frontend.Language where
 
 import Control.Applicative ((<|>))
-import Control.Monad (void)
-import Data.Attoparsec.Text (Parser)
+import Control.Monad (forM_, void)
+import Control.Monad.Trans.Except
+import Control.Monad.Trans.State.Strict
+import Data.Attoparsec.Text (Parser, (<?>))
 import qualified Data.Attoparsec.Text as Atto
-import qualified Data.Map.Lazy as Lazy (Map)
-import qualified Data.Map.Lazy as Lazy.Map
+import Data.Functor.Identity (Identity (..))
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Bits
 import Data.Char (isAlpha, isSpace, ord)
+import Data.DList (DList)
+import qualified Data.DList as DList
+import Data.Either (partitionEithers)
 import Data.Int
+import Data.List.NonEmpty (NonEmpty, nonEmpty)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word
@@ -171,12 +178,12 @@ parse_f64 = Atto.double
 type Label = Text
 
 parse_label :: Parser Label
-parse_label = Atto.takeWhile1 isAlpha
+parse_label = Atto.takeWhile1 (\c -> isAlpha c || c == '_' || c == '-')
 
 -- | Check for an address first and otherwise try a label.
 parse_label_or_address :: Parser (Either Label Address)
 parse_label_or_address = Atto.choice
-  [ Right <$> parse_address
+  [ Right <$  Atto.char '%' <*> parse_address
   , Left  <$> parse_label
   ]
 
@@ -228,47 +235,47 @@ deriving instance Show Instruction
 
 parse_instruction :: Parser Instruction
 parse_instruction = Atto.choice
-  [ Trace <$ Atto.string "trace" <* ws <*> parse_address <* ws <*> parse_address
+  [ Trace <$ Atto.string "trace" <* ws <*> parse_address <* ws <*> parse_address <?> "trace"
 
-  , Stop   <$ Atto.string "stop"
-  , Branch <$ Atto.string "branch" <* ws <*> parse_label_or_address <* ws <*> parse_address
-  , Jump   <$ Atto.string "jump"   <* ws <*> parse_label_or_address
+  , Stop   <$ Atto.string "stop" <?> "stop"
+  , Branch <$ Atto.string "branch" <* ws <*> parse_label_or_address <* ws <*> parse_address <?> "branch"
+  , Jump   <$ Atto.string "jump"   <* ws <*> parse_label_or_address <?> "jump"
 
-  , Copy <$ Atto.string "copy" <* ws <*> parse_type     <* ws <*> parse_address <* ws <*> parse_address
-  , Set  <$ Atto.string "set"  <* ws <*> parse_constant <* ws <*> parse_address
+  , Copy <$ Atto.string "copy" <* ws <*> parse_type     <* ws <*> parse_address <* ws <*> parse_address <?> "copy"
+  , Set  <$ Atto.string "set"  <* ws <*> parse_constant <* ws <*> parse_address <?> "set"
 
-  , Read  <$ Atto.string "read"  <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Write <$ Atto.string "write" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
+  , Read  <$ Atto.string "read"  <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "read"
+  , Write <$ Atto.string "write" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "write"
 
-  , Or     <$ Atto.string "or"     <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , And    <$ Atto.string "and"    <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Xor    <$ Atto.string "xor"    <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Not    <$ Atto.string "not"    <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address
-  , Shiftl <$ Atto.string "shiftl" <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Shiftr <$ Atto.string "shiftr" <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
+  , Or     <$ Atto.string "or"     <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "or"
+  , And    <$ Atto.string "and"    <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "and"
+  , Xor    <$ Atto.string "xor"    <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "xor"
+  , Not    <$ Atto.string "not"    <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <?> "not"
+  , Shiftl <$ Atto.string "shiftl" <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "shiftl"
+  , Shiftr <$ Atto.string "shiftr" <* ws <*> parse_uitype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "shiftr"
 
-  , Add <$ Atto.string "add" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Sub <$ Atto.string "sub" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Mul <$ Atto.string "mul" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Div <$ Atto.string "div" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Mod <$ Atto.string "mod" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
+  , Add <$ Atto.string "add" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "add"
+  , Sub <$ Atto.string "sub" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "sub"
+  , Mul <$ Atto.string "mul" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "mul"
+  , Div <$ Atto.string "div" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "div"
+  , Mod <$ Atto.string "mod" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "mod"
 
-  , Abs  <$ Atto.string "abs"  <* ws <*> parse_sitype <* ws <*> parse_address <* ws <*> parse_address
-  , Absf <$ Atto.string "absf" <* ws <*> parse_ftype  <* ws <*> parse_address <* ws <*> parse_address
+  , Abs  <$ Atto.string "abs"  <* ws <*> parse_sitype <* ws <*> parse_address <* ws <*> parse_address <?> "abs"
+  , Absf <$ Atto.string "absf" <* ws <*> parse_ftype  <* ws <*> parse_address <* ws <*> parse_address <?> "absf"
 
-  , Pow <$ Atto.string "pow" <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Log <$ Atto.string "log" <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Sin <$ Atto.string "sin" <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address
-  , Exp <$ Atto.string "exp" <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address
-  , Ln  <$ Atto.string "ln"  <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address
+  , Pow <$ Atto.string "pow" <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "pow"
+  , Log <$ Atto.string "log" <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "log"
+  , Sin <$ Atto.string "sin" <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address <?> "sin"
+  , Exp <$ Atto.string "exp" <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address <?> "exp"
+  , Ln  <$ Atto.string "ln"  <* ws <*> parse_ftype <* ws <*> parse_address <* ws <*> parse_address <?> "ln"
 
-  , Eq <$ Atto.string "eq" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Lt <$ Atto.string "lt" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
-  , Gt <$ Atto.string "gt" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address
+  , Eq <$ Atto.string "eq" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "eq"
+  , Lt <$ Atto.string "lt" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "lt"
+  , Gt <$ Atto.string "gt" <* ws <*> parse_type <* ws <*> parse_address <* ws <*> parse_address <* ws <*> parse_address <?> "gt"
 
-  , Castf <$ Atto.string "castf" <* ws <*> parse_ftype  <* ws <*> parse_address <* ws <*> parse_address
-  , Ftoi  <$ Atto.string "ftoi"  <* ws <*> parse_ftype  <* ws <*> parse_sitype  <* ws <*> parse_address <* ws <*> parse_address
-  , Itof  <$ Atto.string "itof"  <* ws <*> parse_sitype <* ws <*> parse_ftype   <* ws <*> parse_address <* ws <*> parse_address
+  , Castf <$ Atto.string "castf" <* ws <*> parse_ftype  <* ws <*> parse_address <* ws <*> parse_address <?> "castf"
+  , Ftoi  <$ Atto.string "ftoi"  <* ws <*> parse_ftype  <* ws <*> parse_sitype  <* ws <*> parse_address <* ws <*> parse_address <?> "ftoi"
+  , Itof  <$ Atto.string "itof"  <* ws <*> parse_sitype <* ws <*> parse_ftype   <* ws <*> parse_address <* ws <*> parse_address <?> "itof"
   ]
   where
   ws :: Parser ()
@@ -280,10 +287,10 @@ parse_comment = Atto.char '#' *> Atto.takeTill (== '\n')
 
 parse_item :: Parser Item
 parse_item = Atto.choice
-  [ Label <$> parse_label <* Atto.char ':'
-  , Instruction <$> parse_instruction <* Atto.char ';'
-  , Comment <$ parse_comment
-  ]
+  [ (Comment <$ parse_comment) <?> "comment"
+  , (Label <$> parse_label <* Atto.char ':') <?> "label"
+  , (Instruction <$> parse_instruction <* Atto.char ';') <?> "instruction"
+  ] <?> "item"
 
 -- | Every instruction from the algorave low-level language, with support
 -- for labels.
@@ -303,8 +310,12 @@ deriving instance Show Program
 
 -- | colon-separated items with tabs and spaces acceptable.
 -- The final instruction does not need a newline after it.
+--
+-- Problem: we want to be able to run the parser against a known input string
+-- and fail with the proper error message if any item fails to parse.
 parse_program :: Parser Program
-parse_program = Program <$> Atto.many' (ws *> parse_item)
+--parse_program = Program <$> Atto.many' (ws *> parse_item)
+parse_program = Program <$> Atto.manyTill' (ws *> parse_item) (Atto.endOfInput)
   where
   ws = void $ Atto.many' Atto.space
 
@@ -316,88 +327,128 @@ parse_program = Program <$> Atto.many' (ws *> parse_item)
 
 -- For each label, its resolved offset in the program. Must use a lazy
 -- map, for we will use lookups before the map has been completely constructed.
-type JumpTable = Lazy.Map Text Word32
+type JumpTable = Map Text Word32
 
--- TODO error handling (unknown labels).
-assemble :: Program -> L.Program
+data AssembleError where
+  UnknownLabel :: Text -> AssembleError
+
+deriving instance Show AssembleError
+
+data AssembleState = AssembleState
+  { instruction_counter :: !Word32
+  -- The map from labels to the instruction index to which they should resolve.
+  -- This is extended by Label items.
+  , jump_table          :: JumpTable
+  , instructions        :: JumpTable -> Except AssembleError (DList L.Instruction)
+  }
+
+-- What we want to do is fold over the list of instructions and compute
+--   - the instruction index at each spot
+--   - the map of label to instruction index
+-- and from this get a _continuation_ which can produce either errors or the
+-- assembled program.
+
+type Assemble = State AssembleState
+
+assemble :: Program -> Either AssembleError L.Program
 assemble (Program items) =
-  let (_, _, instructions) = foldl assemble_item initial_state items
-  in  L.Program (reverse instructions)
-  where
-  -- The jump table and the current index (does not increase for label items).
-  -- Third component is the assembled program in reverse order (it's a left
-  -- fold).
-  initial_state :: (JumpTable, Word32, [L.Instruction])
-  initial_state = (Lazy.Map.empty, 0, [])
+  let astate = AssembleState
+        { instruction_counter = 0
+        , jump_table = Map.empty
+        , instructions = const (pure DList.empty)
+        }
+      Identity astate' = execStateT (forM_ items assemble_item) astate
+  in  runIdentity . runExceptT . fmap (L.Program . DList.toList) $
+        instructions astate' (jump_table astate')
+      
 
+assemble_item :: Item -> Assemble ()
+assemble_item item = case item of
+  Instruction inst -> assemble_instruction inst
+  Label lbl -> modify $ \as -> as
+    { jump_table = Map.insert lbl (instruction_counter as) (jump_table as)
+    }
+  Comment -> pure ()
 
--- TODO assemble errors for unresolved labels.
--- Semantics for duplicate labels? It'll jump to the one that appeared closest
--- before.
-assemble_item
-  :: (JumpTable, Word32, [L.Instruction])
-  -> Item
-  -> (JumpTable, Word32, [L.Instruction])
-assemble_item (jump_table, !idx, insts) item = case item of
-  Instruction inst ->
-    -- Essential that we do not force this, because Branch and Jump on labels
-    -- use the map which may not have the desired label just yet.
-    let inst' = assemble_instruction jump_table inst
-    in  (jump_table, idx+1, (inst':insts))
-  -- Semantics for duplicate labels
-  Label       lbl  ->
-    -- May overwrite a prior label, but that's fine. For duplicate labels,
-    -- branches and jumps will resolve to the one most recently defined before
-    -- that instruction.
-    let jump_table' = Lazy.Map.insert lbl idx jump_table
-    in  (jump_table', idx, insts)
-  Comment -> (jump_table, idx, insts)
+add_simple_instruction :: L.Instruction -> Assemble ()
+add_simple_instruction inst = modify $ \as -> as
+  { instruction_counter = instruction_counter as + 1
+  , instructions = \jt -> do
+      insts <- instructions as jt
+      pure (DList.snoc insts inst)
+  }
 
 -- | Resolve the labels in branch and jump. Everything else is trivial.
-assemble_instruction :: JumpTable -> Instruction -> L.Instruction
-assemble_instruction jt inst = case inst of
+-- For branch and jump, they expand to 2 instructions: one to set the target
+-- address in location 0x00, and the next to actually do the jump or branch.
+assemble_instruction :: Instruction -> Assemble ()
+assemble_instruction inst = case inst of
 
-  Branch (Left l) b -> case Lazy.Map.lookup l jt of
-    Nothing -> error ("assemble_instruction: unknown label " ++ show l)
-    Just a -> L.Branch a b
-  Jump (Left l) -> case Lazy.Map.lookup l jt of
-    Nothing -> error ("assemble_instruction: unknown label " ++ show l)
-    Just a -> L.Jump a
+  Branch (Left l) b -> modify $ \as -> as
+    { instruction_counter = instruction_counter as + 2
+    , instructions = \jt -> do
+        insts <- instructions as jt
+        case Map.lookup l jt of
+          Nothing   -> throwE (UnknownLabel l)
+          Just addr ->
+            -- Jump/branch addresses are relative. The current index is
+            -- instruction_counter as + 1 so we subtract  that from the
+            -- desired jump point.
+            -- We added 2 to instruction counter above because we want it to
+            -- give the _next_ instruction index.
+            let raddr :: Int32
+                raddr = fromIntegral addr - fromIntegral (instruction_counter as + 1)
+            in  pure (DList.append insts (DList.fromList [L.Set (I32 raddr) 0x00, L.Branch 0x00 b]))
+          
+    }
 
-  Trace a b -> L.Trace a b
-  Stop -> L.Stop
-  Branch (Right a) b -> L.Branch a b
-  Jump (Right a) -> L.Jump a
-  Copy a b c -> L.Copy a b c
-  Set a b -> L.Set a b
-  Read a b c d -> L.Read a b c d
-  Write a b c d -> L.Write a b c d
-  Or a b c d -> L.Or a b c d
-  And a b c d -> L.And a b c d
-  Xor a b c d -> L.Xor a b c d
-  Not a b c -> L.Not a b c
-  Shiftl a b c d -> L.Shiftl a b c d
-  Shiftr a b c d -> L.Shiftr a b c d
+  Jump (Left l) -> modify $ \as -> as
+    { instruction_counter = instruction_counter as + 2
+    , instructions = \jt -> do
+        insts <- instructions as jt
+        case Map.lookup l jt of
+          Nothing   -> throwE (UnknownLabel l)
+          Just addr ->
+            let raddr :: Int32
+                raddr = fromIntegral addr - fromIntegral (instruction_counter as + 1)
+            in  pure (DList.append insts (DList.fromList [L.Set (I32 raddr) 0x00, L.Jump 0x00]))
+          
+    }
 
-  Add a b c d -> L.Add a b c d
-  Sub a b c d -> L.Sub a b c d
-  Mul a b c d -> L.Mul a b c d
-  Div a b c d -> L.Div a b c d
-  Mod a b c d -> L.Mod a b c d
+  Trace a b -> add_simple_instruction (L.Trace a b)
+  Stop -> add_simple_instruction (L.Stop)
+  Branch (Right a) b -> add_simple_instruction (L.Branch a b)
+  Jump (Right a) -> add_simple_instruction (L.Jump a)
+  Copy a b c -> add_simple_instruction (L.Copy a b c)
+  Set a b -> add_simple_instruction (L.Set a b)
+  Read a b c d -> add_simple_instruction (L.Read a b c d)
+  Write a b c d -> add_simple_instruction (L.Write a b c d)
+  Or a b c d -> add_simple_instruction (L.Or a b c d)
+  And a b c d -> add_simple_instruction (L.And a b c d)
+  Xor a b c d -> add_simple_instruction (L.Xor a b c d)
+  Not a b c -> add_simple_instruction (L.Not a b c)
+  Shiftl a b c d -> add_simple_instruction (L.Shiftl a b c d)
+  Shiftr a b c d -> add_simple_instruction (L.Shiftr a b c d)
 
-  Abs a b c -> L.Abs a b c
-  Absf a b c -> L.Absf a b c
+  Add a b c d -> add_simple_instruction (L.Add a b c d)
+  Sub a b c d -> add_simple_instruction (L.Sub a b c d)
+  Mul a b c d -> add_simple_instruction (L.Mul a b c d)
+  Div a b c d -> add_simple_instruction (L.Div a b c d)
+  Mod a b c d -> add_simple_instruction (L.Mod a b c d)
 
-  Pow a b c d -> L.Pow a b c d
-  Log a b c d -> L.Log a b c d
-  Sin a b c -> L.Sin a b c
-  Exp a b c -> L.Exp a b c
-  Ln a b c -> L.Ln a b c
+  Abs a b c -> add_simple_instruction (L.Abs a b c)
+  Absf a b c -> add_simple_instruction (L.Absf a b c)
 
-  Eq a b c d -> L.Eq a b c d
-  Lt a b c d -> L.Lt a b c d
-  Gt a b c d -> L.Gt a b c d
+  Pow a b c d -> add_simple_instruction (L.Pow a b c d)
+  Log a b c d -> add_simple_instruction (L.Log a b c d)
+  Sin a b c -> add_simple_instruction (L.Sin a b c)
+  Exp a b c -> add_simple_instruction (L.Exp a b c)
+  Ln a b c -> add_simple_instruction (L.Ln a b c)
 
-  Castf a b c -> L.Castf a b c
-  Ftoi a b c d -> L.Ftoi a b c d
-  Itof a b c d -> L.Itof a b c d
+  Eq a b c d -> add_simple_instruction (L.Eq a b c d)
+  Lt a b c d -> add_simple_instruction (L.Lt a b c d)
+  Gt a b c d -> (add_simple_instruction (L.Gt a b c d))
+
+  Castf a b c  -> add_simple_instruction (L.Castf a b c)
+  Ftoi a b c d -> add_simple_instruction (L.Ftoi a b c d)
+  Itof a b c d -> add_simple_instruction (L.Itof a b c d)
