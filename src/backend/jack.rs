@@ -395,10 +395,10 @@ impl IsInputRegion for JackInputRegion {
                     if raw_midi.time != rframe as u32 { continue; }
                     // FIXME check for overflow.
                     // This will panic and kill the program :O :O
-                    buffer[offset..offset+3].copy_from_slice(&addr.to_le_bytes());
+                    buffer[offset..offset+4].copy_from_slice(&(addr as u32).to_le_bytes());
                     offset += 4;
                     let size = raw_midi.bytes.len() as usize;
-                    buffer[addr..addr+3].copy_from_slice(&size.to_le_bytes());
+                    buffer[addr..addr+4].copy_from_slice(&(size as u32).to_le_bytes());
                     addr += 4;
                     buffer[addr..(addr+size)].copy_from_slice(raw_midi.bytes);
                     addr += size;
